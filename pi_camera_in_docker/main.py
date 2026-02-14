@@ -19,7 +19,7 @@ from picamera2.outputs import FileOutput
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="Picamera2 MJPEG streaming demo with options")
-parser.add_argument("--resolution", type=str, help="Video resolution in WIDTHxHEIGHT format (default: 640x480)", default="640x480")
+parser.add_argument("--resolution", type=str, help="Video resolution in WIDTHxHEIGHT format (default: 1920x1080)", default="1920x1080")
 parser.add_argument("--edge_detection", action="store_true", help="Enable edge detection")
 args = parser.parse_args()
 
@@ -29,10 +29,10 @@ resolution = tuple(map(int, args.resolution.split('x')))
 PAGE = """\
 <html>
 <head>
-<title>picamera2 MJPEG streaming demo</title>
+<title>SECURITY CAMERA</title>
 </head>
 <body>
-<h1>Picamera2 MJPEG Streaming Demo</h1>
+<h1>Live Image</h1>
 <img src="stream.mjpg" width="{width}" height="{height}" />
 </body>
 </html>
@@ -111,7 +111,7 @@ output = StreamingOutput()
 picam2.start_recording(JpegEncoder(), FileOutput(output))
 
 try:
-    address = ('', 8000)
+    address = ('0.0.0.0', 8000)
     server = StreamingServer(address, StreamingHandler)
     server.serve_forever()
 finally:
