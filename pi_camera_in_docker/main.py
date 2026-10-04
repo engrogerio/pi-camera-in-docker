@@ -1,118 +1,135 @@
-#!/usr/bin/python3
-
-# Mostly copied from https://picamera.readthedocs.io/en/release-1.13/recipes2.html
-# Run this script, then point a web browser at http:<this-ip-address>:8000
-# Note: needs simplejpeg to be installed (pip3 install simplejpeg).
-
-import argparse
-import cv2
-from http import server
 import io
-import logging
+import time
+import asyncio
 import numpy as np
-import socketserver
+import cv2
+
 from threading import Condition
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse, Response
+from contextlib import asynccontextmanager
 
 from picamera2 import Picamera2
 from picamera2.encoders import JpegEncoder
 from picamera2.outputs import FileOutput
 
-# Parse command line arguments
-parser = argparse.ArgumentParser(description="Picamera2 MJPEG streaming demo with options")
-parser.add_argument("--resolution", type=str, help="Video resolution in WIDTHxHEIGHT format (default: 1920x1080)", default="1920x1080")
-parser.add_argument("--edge_detection", action="store_true", help="Enable edge detection")
-args = parser.parse_args()
 
-# Parse resolution
-resolution = tuple(map(int, args.resolution.split('x')))
-
-PAGE = """\
-<html>
-<head>
-<title>SECURITY CAMERA</title>
-</head>
-<body>
-<h1>Live Image</h1>
-<img src="stream.mjpg" width="{width}" height="{height}" />
-</body>
-</html>
-""".format(width=resolution[0], height=resolution[1])
-
-
+# -------------------------------------------------
+# Your original StreamingOutput (kept intact)
+# -------------------------------------------------
 class StreamingOutput(io.BufferedIOBase):
-    def __init__(self):
+    def __init__(self, edge_detection=True):
         self.frame = None
         self.condition = Condition()
+        self.edge_detection = edge_detection
 
     def write(self, buf):
-        if args.edge_detection:
-            # Convert the image buffer to a numpy array
+        if self.edge_detection:
             img_array = np.frombuffer(buf, dtype=np.uint8)
-            # Decode the image array into an image
             img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            # Apply edge detection
             edges = cv2.Canny(img, 100, 200)
-            # Encode the result back to JPEG
             _, buf = cv2.imencode('.jpg', edges)
             buf = buf.tobytes()
+
         with self.condition:
             self.frame = buf
             self.condition.notify_all()
 
 
-class StreamingHandler(server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/':
-            self.send_response(301)
-            self.send_header('Location', '/index.html')
-            self.end_headers()
-        elif self.path == '/index.html':
-            content = PAGE.encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.send_header('Content-Length', len(content))
-            self.end_headers()
-            self.wfile.write(content)
-        elif self.path == '/stream.mjpg':
-            self.send_response(200)
-            self.send_header('Age', 0)
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
-            self.end_headers()
-            try:
-                while True:
-                    with output.condition:
-                        output.condition.wait()
-                        frame = output.frame
-                    self.wfile.write(b'--FRAME\r\n')
-                    self.send_header('Content-Type', 'image/jpeg')
-                    self.send_header('Content-Length', len(frame))
-                    self.end_headers()
-                    self.wfile.write(frame)
-                    self.wfile.write(b'\r\n')
-            except Exception as e:
-                logging.warning(
-                    'Removed streaming client %s: %s',
-                    self.client_address, str(e))
-        else:
-            self.send_error(404)
-            self.end_headers()
+# -------------------------------------------------
+# Lifespan: startup / shutdown
+# -------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
 
+    resolution = (1080, 1920)
 
-class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(
+        main={"size": resolution}
+    )
+    picam2.configure(config)
 
+    output = StreamingOutput(edge_detection=False)
 
-picam2 = Picamera2()
-picam2.configure(picam2.create_video_configuration(main={"size": resolution}))
-output = StreamingOutput()
-picam2.start_recording(JpegEncoder(), FileOutput(output))
+    picam2.start_recording(JpegEncoder(), FileOutput(output))
 
-try:
-    address = ('0.0.0.0', 8000)
-    server = StreamingServer(address, StreamingHandler)
-    server.serve_forever()
-finally:
+    app.state.picam2 = picam2
+    app.state.output = output
+
+    yield
+
     picam2.stop_recording()
+    picam2.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# -------------------------------------------------
+# /stream  (Live MJPEG)
+# -------------------------------------------------
+def generate_stream(output: StreamingOutput):
+    while True:
+        with output.condition:
+            output.condition.wait()
+            frame = output.frame
+
+        yield (
+            b"--FRAME\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            frame +
+            b"\r\n"
+        )
+
+
+@app.get("/stream")
+async def stream():
+    return StreamingResponse(
+        generate_stream(app.state.output),
+        media_type="multipart/x-mixed-replace; boundary=FRAME"
+    )
+
+
+# -------------------------------------------------
+# /frame  (Single JPEG)
+# -------------------------------------------------
+app.get("/frame")
+async def frame():
+    output = app.state.output
+
+    with output.condition:
+        if output.frame is None:
+            raise HTTPException(status_code=503, detail="Camera not ready")
+        frame = output.frame
+
+    return Response(content=frame, media_type="image/jpeg")
+
+
+# -------------------------------------------------
+# /clip?duration=5.0  (MJPEG clip, no file)
+# -------------------------------------------------
+@app.get("/clip")
+async def clip(duration: float = Query(5.0, ge=0.1, le=60.0)):
+
+    output = app.state.output
+    start = time.time()
+
+    def clip_generator():
+        while time.time() - start < duration:
+            with output.condition:
+                output.condition.wait()
+                frame = output.frame
+
+            yield (
+                b"--FRAME\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" +
+                frame +
+                b"\r\n"
+            )
+
+    return StreamingResponse(
+        clip_generator(),
+        media_type="multipart/x-mixed-replace; boundary=FRAME"
+    )
+
